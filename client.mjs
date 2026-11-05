@@ -50,6 +50,15 @@ const easeIn = (k) => k * k * k;
 // 标点符号保留在时间轴里（不占额外时间设计），是否显示由渲染层「屏蔽标点」开关决定——
 // 关闭开关时同一行的标点立即恢复显示，无需重建字列表、不会打断正在读的字。
 const visibleChars = (text) => Array.from(text).filter((ch) => !/\s/.test(ch));
+// 「屏蔽标点」只隐藏真正的句读标点（白名单）。不用 Unicode 全标点类 \p{P}——
+// \p{P} 会把间隔号、脚注符、项目符号等符号型字符也一起吞掉，误伤歌词里的字。
+// 不在名单内的字符一律照常显示、照常亮圈。
+const PUNCT_SET = new Set([
+  '，', '。', '、', '！', '？', '；', '：', '“', '”', '‘', '’', '（', '）',
+  '【', '】', '《', '》', '〈', '〉', '「', '」', '『', '』', '…', '—', '–', '·', '・', '‥',
+  ',', '.', '!', '?', ';', ':', '(', ')', '[', ']', '{', '}', '"', "'", '-', '~', '`',
+  '@', '#', '$', '%', '^', '&', '*', '+', '=', '_', '/', '\\', '|', '<', '>',
+]);
 const buildCharTimings = (line) => {
   const timings = [];
   if (line.words.length > 0) {
@@ -64,6 +73,26 @@ const buildCharTimings = (line) => {
         });
       });
     });
+    // 异常空隙修正：歌词数据偶尔把"行尾字"的时间戳错标到行末（如行尾字被甩到
+    // 整行最后），导致正常读词时该字永远等不到、渲染不出来。
+    // 判定条件（只针对"行尾字 + 行尾大段空白"这种强错位特征，避免误伤本来就
+    // 慢速隔开、字均匀分布在整行的歌词）：
+    //   ① 行尾字与前一字空隙 > 3 秒；
+    //   ② 该空隙占整行时长的 30% 以上（行内字都挤在前段、行尾大段空白）。
+    // 满足才把行尾字前移接上前字（留 0.1s 自然间隔）。
+    const MAX_GAP = 3;
+    const n = timings.length;
+    if (n >= 2) {
+      const last = timings[n - 1];
+      const prev = timings[n - 2];
+      const gap = last.start - prev.end;
+      const lineSpan = Math.max(0.001, line.endTime - line.startTime);
+      if (gap > MAX_GAP && gap > 0.3 * lineSpan) {
+        const shift = gap - 0.1;
+        last.start -= shift;
+        last.end -= shift;
+      }
+    }
     return timings;
   }
   const chars = visibleChars(line.fullText);
@@ -242,12 +271,35 @@ const mountStardrift = (folium, container, ctx) => {
 
   // 字生命周期：光点放大成字（缩放时间，秒，受停留时间约束）→ 保持念唱 → 停留显示 → 变色缩小消失（缩放时间×2）。
 
+  // 按歌词时间定位当前行：进度跳转后立刻定位到正确行，不依赖播放器行索引的滞后更新。
+  const locateLine = (t) => {
+    const ls = ctx.lines;
+    if (!Array.isArray(ls) || ls.length === 0) return -1;
+    for (let i = 0; i < ls.length; i += 1) {
+      const st = ls[i].startTime;
+      const en = ls[i].endTime;
+      if (typeof st === 'number' && typeof en === 'number' && t >= st && t < en) return i;
+    }
+    const first = ls[0];
+    if (typeof first.startTime === 'number' && t < first.startTime) return 0;
+    return ls.length - 1;
+  };
+
   const draw = () => {
     const time = ctx.lyricTime.get();
     const paused = ctx.isPaused();
     // 帧间隔（秒），用于流星按秒速移动；首帧按 1/60。
     const dt = lastTime == null ? 1 / 60 : Math.min(0.1, Math.max(0, time - lastTime));
+    const jumped = lastTime != null && (time - lastTime < -0.01 || time - lastTime > 0.5);
     lastTime = time;
+    if (jumped) {
+      // 进度跳转（快进/回退）：清掉按旧时间线残留的星星、流星、歌词字，
+      // 下一帧按新时间重建，避免"背景消失/画面空白卡住"。
+      starPool = [];
+      meteors = [];
+      chars = [];
+      renderedIndex = -1;
+    }
 
     const theme = ctx.getTheme();
     const primary = toRgb(theme.primaryColor, theme.isDaylight ? '#000' : '#fff');
@@ -272,7 +324,9 @@ const mountStardrift = (folium, container, ctx) => {
     }
     const speed = Math.max(0.4, sweep);
 
-    const index = ctx.staticMode && ctx.staticLineIndex !== null ? ctx.staticLineIndex : ctx.getLineIndex();
+    const index = ctx.staticMode && ctx.staticLineIndex !== null
+      ? ctx.staticLineIndex
+      : jumped ? locateLine(time) : ctx.getLineIndex();
     if (index !== renderedIndex) {
       renderedIndex = index;
       buildChars(index, time, speed);
@@ -302,7 +356,7 @@ const mountStardrift = (folium, container, ctx) => {
 
     // 星星池：过期移除；按密度以随机概率补充新星（随机位置随机时刻冒出来），
     // 并保证画面始终有一定数量在闪，首帧自动填满。
-    starPool = starPool.filter((s) => time - s.born < s.lifetime);
+    starPool = starPool.filter((s) => { const age = time - s.born; return age >= 0 && age < s.lifetime; });
     const spawnProb = Math.min(0.5, Math.max(4, Number(settings.density ?? 150)) / 180);
     if (starPool.length < Number(settings.density ?? 150) * 1.6 && Math.random() < spawnProb) {
       starPool.push(spawnStar(time));
@@ -376,8 +430,8 @@ const mountStardrift = (folium, container, ctx) => {
       const appearT = Math.min(Math.max(0.2, Number(settings.zoom ?? 0.5)), holdSec || 0.2);
       const fadeT = appearT * 2;
       chars.forEach((c) => {
-        // 屏蔽标点：标点符号不显示、也不亮光圈（开关 punctHide，默认开）
-        if (settings.punctHide !== false && /[\p{P}]/u.test(c.char)) return;
+        // 屏蔽标点：白名单内的句读标点不显示、也不亮光圈（开关 punctHide，默认开）
+        if (settings.punctHide !== false && PUNCT_SET.has(c.char)) return;
         const local = (time - c.start) / speed;
         const holdEnd = appearT + c.dur + holdSec;
         if (local < 0 || local > holdEnd + fadeT) return;
